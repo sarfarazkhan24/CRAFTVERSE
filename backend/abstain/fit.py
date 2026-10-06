@@ -5,9 +5,13 @@ import torch
 import torch.nn as nn
 from sklearn.model_selection import train_test_split
 from .layers.ood import MahalanobisOOD
+from .adapter import ensure_batched_scores
 
 def calculate_temperature(logits, labels, device="cpu"):
     """Fits temperature using LBFGS."""
+    if logits.min() >= 0.0 and torch.allclose(logits.sum(dim=1), torch.ones(logits.size(0)), atol=1e-2):
+        logits = torch.log(logits.clamp(min=1e-12))
+        
     temperature = nn.Parameter(torch.ones(1, device=device) * 1.0)
     criterion = nn.CrossEntropyLoss()
     optimizer = torch.optim.LBFGS([temperature], lr=0.01, max_iter=50)
@@ -19,7 +23,7 @@ def calculate_temperature(logits, labels, device="cpu"):
         return loss
 
     optimizer.step(closure)
-    return temperature.item()
+    return max(float(temperature.item()), 0.01)
 
 def fit_mahalanobis(features, labels, num_classes):
     """Calculates class means and shared covariance."""
@@ -57,22 +61,43 @@ def fit_reference_set(adapter, model, reference_dir, output_config_path):
     model.eval()
 
     classes = sorted([d for d in os.listdir(reference_dir) if os.path.isdir(os.path.join(reference_dir, d))])
-    class_to_idx = {c: i for i, c in enumerate(classes)}
-    
+    num_cls_count = max(len(classes), 1)
+    # Dynamic budget to keep total images ~30-45: fast fit (<20s) with enough samples for calibration
+    MAX_PER_CLASS = max(3, min(20, 45 // num_cls_count))
     images = []
     labels = []
-    for c in classes:
-        class_dir = os.path.join(reference_dir, c)
-        for f in os.listdir(class_dir):
-            if f.lower().endswith(('.png', '.jpg', '.jpeg')):
-                images.append(os.path.join(class_dir, f))
+    if len(classes) == 0:
+        flat_imgs = [
+            os.path.join(reference_dir, f)
+            for f in os.listdir(reference_dir)
+            if f.lower().endswith(('.png', '.jpg', '.jpeg'))
+        ]
+        images = flat_imgs[:(MAX_PER_CLASS * 2)]
+        labels = [0] * len(images)
+        classes = ["default"]
+    else:
+        class_to_idx = {c: i for i, c in enumerate(classes)}
+        for c in classes:
+            class_dir = os.path.join(reference_dir, c)
+            c_imgs = [
+                os.path.join(class_dir, f)
+                for f in os.listdir(class_dir)
+                if f.lower().endswith(('.png', '.jpg', '.jpeg'))
+            ]
+            # Take up to 3 images per class
+            sampled = c_imgs[:MAX_PER_CLASS]
+            for img_p in sampled:
+                images.append(img_p)
                 labels.append(class_to_idx[c])
                 
-    if len(images) < 10:
-        raise ValueError("Reference directory needs at least 10 images for fitting.")
+    if len(images) < 2:
+        raise ValueError("Reference directory needs at least 2 images for fitting.")
 
     # Split into Half A and Half B
-    X_A, X_B, y_A, y_B = train_test_split(images, labels, test_size=0.5, stratify=labels, random_state=42)
+    try:
+        X_A, X_B, y_A, y_B = train_test_split(images, labels, test_size=0.5, stratify=labels, random_state=42)
+    except Exception:
+        X_A, X_B, y_A, y_B = train_test_split(images, labels, test_size=0.5, shuffle=True, random_state=42)
     
     feature_layer = getattr(adapter, "FEATURE_LAYER", None)
     
@@ -91,16 +116,24 @@ def fit_reference_set(adapter, model, reference_dir, output_config_path):
             
             layer = dict([*model.named_modules()]).get(feature_layer)
             if layer:
-                handle = layer.register_forward_hook(hook)
+                try:
+                    handle = layer.register_forward_hook(hook)
+                except Exception:
+                    handle = None
         
         with torch.no_grad():
             for img_path in X:
+                hooked_features.clear()
                 tensor = adapter.preprocess(img_path).to(device)
-                logits = adapter.predict(model, tensor)
+                scores = ensure_batched_scores(adapter.predict(model, tensor))
+                if scores.min() >= 0.0 and torch.allclose(scores.sum(dim=1), torch.ones(scores.size(0), device=scores.device), atol=1e-2):
+                    logits = torch.log(scores.clamp(min=1e-12))
+                else:
+                    logits = scores
                 all_logits.append(logits.cpu())
                 
                 if handle and len(hooked_features) > 0:
-                    all_features.append(hooked_features.pop().cpu().numpy()[0])
+                    all_features.append(hooked_features[-1].cpu().numpy()[0])
                 
         if handle:
             handle.remove()
@@ -169,13 +202,20 @@ def fit_reference_set(adapter, model, reference_dir, output_config_path):
     best_uncertain_thresh = sorted_risk[0]
     
     n = len(sorted_risk)
-    for i in range(1, n + 1):
-        if 1.0 - sorted_correct[:i].mean() <= 0.05:
-            best_accept_thresh = sorted_risk[i-1]
-            
-    for i in range(1, n + 1):
-        if 1.0 - sorted_correct[:i].mean() <= 0.15:
-            best_uncertain_thresh = sorted_risk[i-1]
+    has_valid_labels = np.any(sorted_correct)
+    if has_valid_labels:
+        for i in range(1, n + 1):
+            if 1.0 - sorted_correct[:i].mean() <= 0.05:
+                best_accept_thresh = sorted_risk[i-1]
+                
+        for i in range(1, n + 1):
+            if 1.0 - sorted_correct[:i].mean() <= 0.15:
+                best_uncertain_thresh = sorted_risk[i-1]
+    else:
+        # Fallback when reference folder labels don't match model output space (e.g. 1000-class ImageNet with arbitrary folder names)
+        # Use calibrated risk distribution quantiles
+        best_accept_thresh = float(np.percentile(sorted_risk, 75))
+        best_uncertain_thresh = float(np.percentile(sorted_risk, 90))
             
     ood_threshold = np.percentile(risks_B[:, 2], 95) if np.any(risks_B[:, 2] > 0) else None
     

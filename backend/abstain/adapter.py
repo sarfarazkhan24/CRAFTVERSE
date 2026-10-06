@@ -3,6 +3,22 @@ import inspect
 import sys
 import os
 
+import torch
+
+
+def ensure_batched_scores(scores: torch.Tensor) -> torch.Tensor:
+    """Normalize a classifier output to the [batch, classes] shape."""
+    if not isinstance(scores, torch.Tensor):
+        raise TypeError("Adapter predict() must return a torch.Tensor.")
+    if scores.ndim == 1:
+        return scores.unsqueeze(0)
+    if scores.ndim == 2:
+        return scores
+    raise ValueError(
+        f"Adapter predict() must return a 1D or 2D tensor, got shape {tuple(scores.shape)}."
+    )
+
+
 def load_adapter(script_path: str):
     """
     Loads a user-provided Python script and validates that it meets the Abstainity Adapter Contract.

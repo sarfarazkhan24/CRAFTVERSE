@@ -28,7 +28,17 @@ def generate_adapter(model_type: str, preset: str, class_name: str = None, kwarg
 
     # Model Loading
     if model_type == "weights_and_script":
-        kwargs_str = ", ".join([f"{k}={repr(v)}" for k, v in (kwargs_dict or {}).items()])
+        def parse_val(v):
+            if not v: return "None"
+            if v.lower() == "true": return "True"
+            if v.lower() == "false": return "False"
+            try:
+                if "." in v: return str(float(v))
+                return str(int(v))
+            except ValueError:
+                return repr(v)
+                
+        kwargs_str = ", ".join([f"{k}={parse_val(v)}" for k, v in (kwargs_dict or {}).items() if v])
         load_code = f"""
     import sys
     import os
@@ -38,7 +48,13 @@ def generate_adapter(model_type: str, preset: str, class_name: str = None, kwarg
     
     model = {class_name}({kwargs_str})
     model_path = os.path.join(os.path.dirname(__file__), "weights.pt")
-    model.load_state_dict(torch.load(model_path, map_location="cpu"))
+    try:
+        weights = torch.load(model_path, map_location="cpu", weights_only=False)
+    except TypeError:
+        weights = torch.load(model_path, map_location="cpu")
+    if isinstance(weights, dict) and "model_state_dict" in weights:
+        weights = weights["model_state_dict"]
+    model.load_state_dict(weights)
 """
     else:
         # full_model
@@ -47,7 +63,17 @@ def generate_adapter(model_type: str, preset: str, class_name: str = None, kwarg
     try:
         model = torch.jit.load(model_path, map_location="cpu")
     except Exception:
-        model = torch.load(model_path, map_location="cpu")
+        try:
+            model = torch.load(model_path, map_location="cpu", weights_only=False)
+        except TypeError:
+            model = torch.load(model_path, map_location="cpu")
+    if isinstance(model, dict) and "model_state_dict" in model:
+        from torchvision import models
+        num_classes = model.get("num_classes", 14)
+        net = models.densenet121(weights=None)
+        net.classifier = nn.Linear(net.classifier.in_features, num_classes)
+        net.load_state_dict(model["model_state_dict"])
+        model = net
 """
 
     code = f"""import os
@@ -95,9 +121,6 @@ def predict(model, x):
     if isinstance(out, tuple):
         out = out[0]
         
-    # If the output is logits (can have negative values or sum != 1), apply softmax
-    if out.min() < 0 or not torch.allclose(out.sum(dim=1), torch.tensor(1.0), atol=1e-3):
-        return torch.softmax(out, dim=1)
     return out
 """
     return code

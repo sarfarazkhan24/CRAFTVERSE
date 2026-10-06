@@ -26,21 +26,31 @@ def run_worker(payload: dict):
             capture_output=True,
             timeout=300 # 5 min timeout
         )
-        if proc.returncode != 0:
-            # Fallback for severe crashes (e.g. segfaults)
-            raise RuntimeError(f"Worker crashed: {proc.stderr.decode('utf-8')}")
-        
-        output = proc.stdout.decode("utf-8")
-        
-        # Output could contain prints from the user model. We find the last valid JSON block.
-        lines = output.strip().split("\n")
-        try:
-            res = json.loads(lines[-1])
-        except json.JSONDecodeError:
-            raise RuntimeError(f"Failed to parse worker output: {lines[-1]}")
+        output = proc.stdout.decode("utf-8", errors="replace")
+        stderr = proc.stderr.decode("utf-8", errors="replace")
+
+        # User adapters may print diagnostics, so find the last JSON line rather
+        # than assuming the subprocess's final byte is the worker response.
+        res = None
+        for line in reversed(output.splitlines()):
+            try:
+                candidate = json.loads(line)
+            except json.JSONDecodeError:
+                continue
+            if isinstance(candidate, dict):
+                res = candidate
+                break
+
+        if res is None:
+            detail = stderr.strip() or output.strip() or "Worker produced no diagnostic output."
+            raise RuntimeError(f"Worker crashed (exit code {proc.returncode}): {detail}")
             
         if res.get("status") == "error":
             raise RuntimeError(f"Worker Error: {res.get('message')}\nTrace: {res.get('trace')}")
+
+        if proc.returncode != 0:
+            detail = stderr.strip() or "Worker exited with a non-zero status."
+            raise RuntimeError(f"Worker crashed (exit code {proc.returncode}): {detail}")
             
         return res
     except subprocess.TimeoutExpired:
@@ -48,6 +58,11 @@ def run_worker(payload: dict):
 
 from inspect_model import inspect_model_script
 from internal_adapter_gen import generate_adapter
+
+@app.get("/")
+@app.get("/api/health")
+async def health_check():
+    return {"status": "ok", "service": "Abstainity API"}
 
 @app.post("/api/inspect_model")
 async def inspect_model(script: UploadFile = File(...)):
@@ -64,21 +79,35 @@ async def upload_model(
     custom_size: Optional[str] = Form(None),
     custom_mean: Optional[str] = Form(None),
     custom_std: Optional[str] = Form(None),
-    model_file: UploadFile = File(...),
+    model_file: Optional[UploadFile] = File(None),
     script_file: Optional[UploadFile] = File(None),
     class_names_file: Optional[UploadFile] = File(None)
 ):
+    if model_type == "test_script":
+        if not script_file:
+            raise HTTPException(status_code=400, detail="Inference script (test.py) is required for auto-configuration.")
+    elif model_type == "weights_and_script":
+        if not model_file or not script_file:
+            raise HTTPException(status_code=400, detail="Both model weights file and architecture script are required.")
+    else: # full_model
+        if not model_file:
+            raise HTTPException(status_code=400, detail="PyTorch model file (.pt / .pth) is required.")
+
     if model_type == "test_script" and script_file:
         script_path = os.path.join(WORKSPACE_DIR, "user_test.py")
         script_text = (await script_file.read()).decode("utf-8")
-        with open(script_path, "w") as f:
+        with open(script_path, "w", encoding="utf-8") as f:
             f.write(script_text)
             
         if model_file:
+            model_bytes = await model_file.read()
             weights_path = os.path.join(WORKSPACE_DIR, model_file.filename)
             with open(weights_path, "wb") as f:
-                # Need to read as chunks or use shutil if it's large, but .read() is fine for now
-                f.write(await model_file.read())
+                f.write(model_bytes)
+            # Also save as model.pt so generated scripts can reliably locate it
+            default_model_path = os.path.join(WORKSPACE_DIR, "model.pt")
+            with open(default_model_path, "wb") as f:
+                f.write(model_bytes)
                 
         # AST logic (skipped for now, assuming fail)
         ast_success = False
@@ -96,7 +125,7 @@ async def upload_model(
                     break
                     
                 adapter_path = os.path.join(WORKSPACE_DIR, "adapter.py")
-                with open(adapter_path, "w") as f:
+                with open(adapter_path, "w", encoding="utf-8") as f:
                     f.write(adapter_code)
                     
                 # Dry run
@@ -104,14 +133,20 @@ async def upload_model(
 import sys
 sys.path.insert(0, '.')
 import adapter
-model = adapter.load_model()
 import torch
-x = torch.randn(1, 3, 224, 224)
+
+model = adapter.load_model()
+try:
+    dev = next(model.parameters()).device
+except Exception:
+    dev = torch.device('cpu')
+
+x = torch.randn(1, 3, 224, 224, device=dev)
 out = adapter.predict(model, x)
 print('SUCCESS_MARKER')
 """
                 test_script_path = os.path.join(WORKSPACE_DIR, "test_adapter.py")
-                with open(test_script_path, "w") as f:
+                with open(test_script_path, "w", encoding="utf-8") as f:
                     f.write(test_script)
                     
                 try:
@@ -119,8 +154,9 @@ print('SUCCESS_MARKER')
                         [sys.executable, "test_adapter.py"],
                         cwd=WORKSPACE_DIR,
                         capture_output=True,
-                        text=True,
-                        timeout=15
+                        encoding="utf-8",
+                        errors="replace",
+                        timeout=45
                     )
                     if "SUCCESS_MARKER" in result.stdout:
                         success = True
@@ -165,7 +201,7 @@ print('SUCCESS_MARKER')
             f.write(await class_names_file.read())
         
     adapter_path = os.path.join(WORKSPACE_DIR, "adapter.py")
-    with open(adapter_path, "w") as f:
+    with open(adapter_path, "w", encoding="utf-8") as f:
         f.write(adapter_code)
         
     # Test the generated adapter by running load_model() in a subprocess
@@ -177,7 +213,7 @@ model = adapter.load_model()
 print('SUCCESS_MARKER')
 """
     test_script_path = os.path.join(WORKSPACE_DIR, "test_adapter.py")
-    with open(test_script_path, "w") as f:
+    with open(test_script_path, "w", encoding="utf-8") as f:
         f.write(test_script)
         
     try:
@@ -185,7 +221,8 @@ print('SUCCESS_MARKER')
             [sys.executable, "test_adapter.py"],
             cwd=WORKSPACE_DIR,
             capture_output=True,
-            text=True,
+            encoding="utf-8",
+            errors="replace",
             timeout=30
         )
         if "SUCCESS_MARKER" not in result.stdout:
@@ -212,8 +249,11 @@ async def upload_reference(file: UploadFile = File(...)):
         shutil.rmtree(ref_dir)
     os.makedirs(ref_dir, exist_ok=True)
     
-    with zipfile.ZipFile(zip_path, 'r') as zip_ref:
-        zip_ref.extractall(ref_dir)
+    try:
+        with zipfile.ZipFile(zip_path, 'r') as zip_ref:
+            zip_ref.extractall(ref_dir)
+    except zipfile.BadZipFile as exc:
+        raise HTTPException(status_code=400, detail="Reference file is not a valid ZIP archive.") from exc
         
     # Optional: flatten if zip contains a single root folder
     extracted_items = os.listdir(ref_dir)
@@ -230,7 +270,12 @@ async def fit():
     script_path = os.path.join(WORKSPACE_DIR, "adapter.py")
     ref_dir = os.path.join(WORKSPACE_DIR, "reference_data")
     config_path = os.path.join(WORKSPACE_DIR, "config.json")
-    
+
+    if not os.path.isfile(script_path):
+        raise HTTPException(status_code=400, detail="Configure a model before fitting.")
+    if not os.path.isdir(ref_dir):
+        raise HTTPException(status_code=400, detail="Upload reference data before fitting.")
+
     payload = {
         "command": "fit",
         "script_path": script_path,
@@ -248,6 +293,9 @@ async def fit():
 async def predict(image: UploadFile = File(...)):
     script_path = os.path.join(WORKSPACE_DIR, "adapter.py")
     config_path = os.path.join(WORKSPACE_DIR, "config.json")
+    
+    if not os.path.isfile(script_path) or os.path.getsize(script_path) == 0:
+        raise HTTPException(status_code=400, detail="Please upload and configure a model (Step 1) before testing images.")
     
     img_path = os.path.join(WORKSPACE_DIR, "test_input.jpg")
     with open(img_path, "wb") as f:

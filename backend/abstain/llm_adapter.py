@@ -16,13 +16,13 @@ def generate_adapter(script_text: str, error_hint: str = None) -> str:
         
     try:
         from groq import Groq
-        client = Groq(api_key=api_key, timeout=15.0)
+        client = Groq(api_key=api_key, timeout=45.0)
         
         system_prompt = (
             "Output ONLY Python code, no markdown fences or explanation. "
             "Define: load_model() -> model in eval mode; "
             "preprocess(path) -> tensor shaped [1,C,H,W]; "
-            "predict(model, x) -> 1D probability tensor (apply softmax if the script outputs logits); "
+            "predict(model, x) -> 1D or 2D tensor of logits / model output scores; "
             "FEATURE_LAYER = '<name of last layer before the classifier head>' or None. "
             "Reuse the script's own code and constants. Remove training code, argparse, and top-level execution. "
             "Do not invent file paths."
@@ -41,12 +41,16 @@ def generate_adapter(script_text: str, error_hint: str = None) -> str:
             temperature=0,
         )
         
-        response_text = completion.choices[0].message.content
-        # Strip markdown fences
-        response_text = re.sub(r"^```python\n", "", response_text.strip())
-        response_text = re.sub(r"^```\n", "", response_text)
-        response_text = re.sub(r"\n```$", "", response_text)
+        response_text = completion.choices[0].message.content.strip()
+        # Robustly strip markdown fences
+        if response_text.startswith("```python"):
+            response_text = response_text[len("```python"):].strip()
+        elif response_text.startswith("```"):
+            response_text = response_text[len("```"):].strip()
+        if response_text.endswith("```"):
+            response_text = response_text[:-3].strip()
         
         return response_text
     except Exception as e:
+        print("LLM Error:", repr(e))
         return None

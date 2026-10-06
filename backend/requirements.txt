@@ -4,5 +4,7 @@ python-multipart
 torch
 torchvision
 numpy
-pillowgroq
+pillow
+groq
 python-dotenv
+pandas
