@@ -1,0 +1,62 @@
+{
+  "$schema": "http://json-schema.org/draft-07/schema#",
+  "title": "Abstainity Prediction Response",
+  "type": "object",
+  "properties": {
+    "prediction": {
+      "type": "integer",
+      "description": "The predicted class index."
+    },
+    "raw_confidence": {
+      "type": "number",
+      "description": "The highest softmax probability from the raw model output."
+    },
+    "calibrated_confidence": {
+      "type": "number",
+      "description": "The confidence after temperature scaling (if Tier 3). Otherwise equals raw_confidence."
+    },
+    "uncertainty": {
+      "type": "number",
+      "description": "The epistemic uncertainty (variance from MC-Dropout). Evaluated in Tiers 1-3. Falls back to entropy if MC-Dropout variance is uncomputable."
+    },
+    "ood_score": {
+      "type": ["number", "null"],
+      "description": "The Mahalanobis distance from the nearest class centroid. Null in Tiers 1 and 2."
+    },
+    "ood_threshold": {
+      "type": ["number", "null"],
+      "description": "The dynamically fitted threshold above which an image is considered OOD. Null in Tiers 1 and 2."
+    },
+    "verdict": {
+      "type": "string",
+      "enum": ["ACCEPT", "UNCERTAIN", "ABSTAIN"],
+      "description": "The final triage decision."
+    },
+    "reason": {
+      "type": "string",
+      "description": "Human-readable explanation for the verdict."
+    },
+    "tier": {
+      "type": "integer",
+      "enum": [1, 2, 3],
+      "description": "Capability tier that ran (1=Black-box, 2=White-box/MC-Dropout, 3=Reference Set/OOD)."
+    },
+    "layers_run": {
+      "type": "array",
+      "items": {
+        "type": "string"
+      },
+      "description": "List of safety layers that successfully executed (e.g., ['temperature_scaling', 'mc_dropout', 'mahalanobis'])."
+    }
+  },
+  "required": [
+    "prediction",
+    "raw_confidence",
+    "calibrated_confidence",
+    "uncertainty",
+    "verdict",
+    "reason",
+    "tier",
+    "layers_run"
+  ]
+}

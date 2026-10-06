@@ -1,677 +1,267 @@
 import os
-import io
+import sys
 import json
-import pickle
-
-import numpy as np
-import torch
-import torch.nn as nn
-torch.set_num_threads(1)
-torch.set_num_interop_threads(1)
-
-from PIL import Image
-from fastapi import (
-    FastAPI,
-    UploadFile,
-    File,
-    HTTPException,
-)
+import subprocess
+import shutil
+import zipfile
+from fastapi import FastAPI, UploadFile, File, Form, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
-from torchvision import models, transforms
+from typing import Optional
 
+app = FastAPI(title="Abstainity API")
+app.add_middleware(CORSMiddleware, allow_origins=["*"], allow_methods=["*"], allow_headers=["*"])
 
-# =========================
-# CONFIG
-# =========================
+WORKSPACE_DIR = os.path.join(os.path.dirname(__file__), "workspace")
+os.makedirs(WORKSPACE_DIR, exist_ok=True)
 
-BASE_DIR = os.path.dirname(
-    os.path.abspath(__file__)
-)
-
-DEVICE = torch.device(
-    "cuda" if torch.cuda.is_available() else "cpu"
-)
-
-CLASSES = [
-    "Atelectasis",
-    "Cardiomegaly",
-    "Consolidation",
-    "Edema",
-    "Effusion",
-    "Emphysema",
-    "Fibrosis",
-    "Hernia",
-    "Infiltration",
-    "Mass",
-    "No Finding",
-    "Nodule",
-    "Pleural_Thickening",
-    "Pneumonia",
-    "Pneumothorax",
-]
-
-MODEL_PATH = os.path.join(
-    BASE_DIR,
-    "model.pt",
-)
-
-TEMP_PATH = os.path.join(
-    BASE_DIR,
-    "temperature.json",
-)
-
-OOD_PATH = os.path.join(
-    BASE_DIR,
-    "ood_params.pkl",
-)
-
-THRESHOLD_PATH = os.path.join(
-    BASE_DIR,
-    "decision_thresholds.json",
-)
-
-MC_DROPOUT_PASSES = 10
-MC_DROPOUT_RATE = 0.20
-
-# This value is also used in composite risk calculation.
-# It can be overridden by decision_thresholds.json.
-DEFAULT_OOD_THRESHOLD = 3000.0
-
-
-# =========================
-# LOAD MODEL
-# =========================
-
-model = models.densenet121(
-    weights=None
-)
-
-model.classifier = nn.Linear(
-    model.classifier.in_features,
-    len(CLASSES),
-)
-
-checkpoint = torch.load(
-    MODEL_PATH,
-    map_location=DEVICE,
-    weights_only=False,
-)
-
-if (
-    isinstance(checkpoint, dict)
-    and "model_state_dict" in checkpoint
-):
-    model.load_state_dict(
-        checkpoint["model_state_dict"]
-    )
-else:
-    model.load_state_dict(
-        checkpoint
-    )
-
-model = model.to(DEVICE)
-model.eval()
-
-
-# =========================
-# LOAD TEMPERATURE
-# =========================
-
-with open(
-    TEMP_PATH,
-    "r",
-) as f:
-    temp_data = json.load(f)
-
-TEMPERATURE = float(
-    temp_data["temperature"]
-)
-
-if TEMPERATURE <= 0:
-    raise ValueError(
-        "Temperature must be greater than zero."
-    )
-
-
-# =========================
-# LOAD OOD PARAMETERS
-# =========================
-
-with open(
-    OOD_PATH,
-    "rb",
-) as f:
-    ood_data = pickle.load(f)
-
-class_means = np.asarray(
-    ood_data["class_means"]
-)
-
-cov_inv = np.asarray(
-    ood_data["covariance_inv"]
-)
-
-
-# =========================
-# LOAD DECISION THRESHOLDS
-# =========================
-
-with open(
-    THRESHOLD_PATH,
-    "r",
-) as f:
-    threshold_data = json.load(f)
-
-ACCEPT_THRESHOLD = float(
-    threshold_data["accept_threshold"]
-)
-
-UNCERTAIN_THRESHOLD = float(
-    threshold_data["uncertain_threshold"]
-)
-
-OOD_THRESHOLD = float(
-    threshold_data.get(
-        "ood_threshold",
-        DEFAULT_OOD_THRESHOLD,
-    )
-)
-
-if OOD_THRESHOLD <= 0:
-    raise ValueError(
-        "OOD threshold must be greater than zero."
-    )
-
-
-# =========================
-# IMAGE TRANSFORM
-# =========================
-
-MEAN = [
-    0.5407,
-    0.5407,
-    0.5407,
-]
-
-STD = [
-    0.2419,
-    0.2419,
-    0.2419,
-]
-
-transform = transforms.Compose(
-    [
-        transforms.Resize(
-            (224, 224)
-        ),
-        transforms.ToTensor(),
-        transforms.Normalize(
-            MEAN,
-            STD,
-        ),
-    ]
-)
-
-
-# =========================
-# FASTAPI
-# =========================
-
-app = FastAPI(
-    title="Clinical AI Safety API",
-    description=(
-        "Chest X-ray prediction with "
-        "confidence, uncertainty and OOD detection"
-    ),
-    version="1.0",
-)
-
-
-# =========================
-# CORS
-# =========================
-
-app.add_middleware(
-    CORSMiddleware,
-    allow_origins=["*"],
-    allow_credentials=True,
-    allow_methods=["*"],
-    allow_headers=["*"],
-)
-
-
-# =========================
-# FEATURE EXTRACTION
-# =========================
-
-def get_features(x):
-    """
-    Extract the 1024-dimensional DenseNet feature vector.
-    """
-
-    features = model.features(x)
-
-    features = torch.relu(
-        features
-    )
-
-    features = torch.nn.functional.adaptive_avg_pool2d(
-        features,
-        (1, 1),
-    )
-
-    features = torch.flatten(
-        features,
-        1,
-    )
-
-    return features
-
-
-# =========================
-# MAHALANOBIS SCORE
-# =========================
-
-def mahalanobis_score(feature):
-    """
-    Calculate the minimum Mahalanobis distance
-    across all class distributions.
-    """
-
-    feature_array = (
-        feature
-        .detach()
-        .cpu()
-        .numpy()[0]
-    )
-
-    scores = []
-
-    for class_id in range(
-        len(CLASSES)
-    ):
-        mean = np.asarray(
-            class_means[class_id]
-        )
-
-        diff = (
-            feature_array - mean
-        )
-
-        score = (
-            diff
-            @ cov_inv
-            @ diff.T
-        )
-
-        scores.append(
-            float(score)
-        )
-
-    return float(
-        min(scores)
-    )
-
-
-# =========================
-# MC DROPOUT
-# =========================
-
-def mc_dropout_prediction(
-    features,
-    passes=MC_DROPOUT_PASSES,
-):
-    """
-    Estimate predictive uncertainty using
-    stochastic dropout passes.
-
-    Temperature scaling is applied to every
-    stochastic pass so uncertainty metrics
-    use calibrated probabilities.
-    """
-
-    predictions = []
-
-    for _ in range(passes):
-        dropped = torch.nn.functional.dropout(
-            features,
-            p=MC_DROPOUT_RATE,
-            training=True,
-        )
-
-        logits = model.classifier(
-            dropped
-        )
-
-        calibrated_logits = (
-            logits / TEMPERATURE
-        )
-
-        probabilities = torch.softmax(
-            calibrated_logits,
-            dim=1,
-        )
-
-        predictions.append(
-            probabilities
-            .detach()
-            .cpu()
-            .numpy()[0]
-        )
-
-    predictions = np.asarray(
-        predictions
-    )
-
-    mean_probability = predictions.mean(
-        axis=0
-    )
-
-    variance = predictions.var(
-        axis=0
-    ).mean()
-
-    entropy = -np.sum(
-        mean_probability
-        * np.log(
-            mean_probability + 1e-10
-        )
-    )
-
-    return (
-        mean_probability,
-        float(variance),
-        float(entropy),
-    )
-
-
-# =========================
-# HEALTH CHECK
-# =========================
-
-@app.get("/health")
-def health():
-    return {
-        "status": "ok",
-        "device": str(DEVICE),
-        "model": "DenseNet-121",
-        "classes": len(CLASSES),
-        "temperature": TEMPERATURE,
-        "mc_dropout_passes": MC_DROPOUT_PASSES,
-        "accept_threshold": ACCEPT_THRESHOLD,
-        "uncertain_threshold": UNCERTAIN_THRESHOLD,
-        "ood_threshold": OOD_THRESHOLD,
-        "ood_threshold_configured": True,
-    }
-
-
-# =========================
-# PREDICTION
-# =========================
-
-@app.post("/predict")
-async def predict(
-    file: UploadFile = File(...),
-):
-    # =========================
-    # READ IMAGE
-    # =========================
-
-    contents = await file.read()
-
-    if not contents:
-        raise HTTPException(
-            status_code=400,
-            detail="Uploaded file is empty.",
-        )
-
+def run_worker(payload: dict):
+    """Executes the Abstainity pipeline in a sandboxed subprocess."""
+    backend_dir = os.path.dirname(__file__)
+    python_exe = sys.executable 
     try:
-        image = Image.open(
-            io.BytesIO(contents)
-        ).convert("RGB")
-
-    except Exception:
-        raise HTTPException(
-            status_code=400,
-            detail=(
-                "Uploaded file is not a valid image. "
-                "Please upload a JPG, PNG, or similar image file."
-            ),
+        proc = subprocess.run(
+            [python_exe, "-m", "abstain.worker"],
+            cwd=backend_dir,
+            input=json.dumps(payload).encode("utf-8"),
+            capture_output=True,
+            timeout=300 # 5 min timeout
         )
+        if proc.returncode != 0:
+            # Fallback for severe crashes (e.g. segfaults)
+            raise RuntimeError(f"Worker crashed: {proc.stderr.decode('utf-8')}")
+        
+        output = proc.stdout.decode("utf-8")
+        
+        # Output could contain prints from the user model. We find the last valid JSON block.
+        lines = output.strip().split("\n")
+        try:
+            res = json.loads(lines[-1])
+        except json.JSONDecodeError:
+            raise RuntimeError(f"Failed to parse worker output: {lines[-1]}")
+            
+        if res.get("status") == "error":
+            raise RuntimeError(f"Worker Error: {res.get('message')}\nTrace: {res.get('trace')}")
+            
+        return res
+    except subprocess.TimeoutExpired:
+        raise RuntimeError("Sandbox worker timed out after 5 minutes.")
 
-    x = transform(
-        image
-    ).unsqueeze(0).to(DEVICE)
+from inspect_model import inspect_model_script
+from internal_adapter_gen import generate_adapter
 
+@app.post("/api/inspect_model")
+async def inspect_model(script: UploadFile = File(...)):
+    content = (await script.read()).decode("utf-8")
+    classes = inspect_model_script(content)
+    return {"classes": classes, "status": "success"}
 
-    # =========================
-    # STANDARD PREDICTION
-    # =========================
+@app.post("/api/upload/model")
+async def upload_model(
+    preset: str = Form("imagenet"),
+    model_type: str = Form("full_model"),
+    class_name: Optional[str] = Form(None),
+    kwargs_json: Optional[str] = Form(None),
+    custom_size: Optional[str] = Form(None),
+    custom_mean: Optional[str] = Form(None),
+    custom_std: Optional[str] = Form(None),
+    model_file: UploadFile = File(...),
+    script_file: Optional[UploadFile] = File(None),
+    class_names_file: Optional[UploadFile] = File(None)
+):
+    if model_type == "test_script" and script_file:
+        script_path = os.path.join(WORKSPACE_DIR, "user_test.py")
+        script_text = (await script_file.read()).decode("utf-8")
+        with open(script_path, "w") as f:
+            f.write(script_text)
+            
+        if model_file:
+            weights_path = os.path.join(WORKSPACE_DIR, model_file.filename)
+            with open(weights_path, "wb") as f:
+                # Need to read as chunks or use shutil if it's large, but .read() is fine for now
+                f.write(await model_file.read())
+                
+        # AST logic (skipped for now, assuming fail)
+        ast_success = False
+        log_messages = []
+        if not ast_success:
+            log_messages.append("AST detection failed -> asking LLM")
+            from abstain.llm_adapter import generate_adapter as llm_gen
+            
+            error_hint = None
+            success = False
+            for attempt in range(3):
+                adapter_code = llm_gen(script_text, error_hint)
+                if not adapter_code:
+                    log_messages.append("LLM fallback unavailable or API error.")
+                    break
+                    
+                adapter_path = os.path.join(WORKSPACE_DIR, "adapter.py")
+                with open(adapter_path, "w") as f:
+                    f.write(adapter_code)
+                    
+                # Dry run
+                test_script = """
+import sys
+sys.path.insert(0, '.')
+import adapter
+model = adapter.load_model()
+import torch
+x = torch.randn(1, 3, 224, 224)
+out = adapter.predict(model, x)
+print('SUCCESS_MARKER')
+"""
+                test_script_path = os.path.join(WORKSPACE_DIR, "test_adapter.py")
+                with open(test_script_path, "w") as f:
+                    f.write(test_script)
+                    
+                try:
+                    result = subprocess.run(
+                        [sys.executable, "test_adapter.py"],
+                        cwd=WORKSPACE_DIR,
+                        capture_output=True,
+                        text=True,
+                        timeout=15
+                    )
+                    if "SUCCESS_MARKER" in result.stdout:
+                        success = True
+                        log_messages.append("dry-run passed")
+                        break
+                    else:
+                        error_hint = f"Output: {result.stdout}\nError: {result.stderr}"
+                        log_messages.append(f"dry-run failed -> retry {attempt+1}/2")
+                except subprocess.TimeoutExpired:
+                    error_hint = "Execution timed out."
+                    log_messages.append(f"dry-run failed (timeout) -> retry {attempt+1}/2")
+                    
+            if not success:
+                log_messages.append("fallback to manual")
+                return {"status": "error", "message": " | ".join(log_messages) + " | Auto-configuration failed. Please use the manual preset-dropdown flow."}
+            else:
+                return {"status": "success", "message": " | ".join(log_messages) + " | Model auto-configured successfully using LLM."}
 
-    with torch.no_grad():
-        features = get_features(x)
-        logits = model.classifier(features)
-
-        calibrated_logits = (
-            logits / TEMPERATURE
-        )
-
-        probabilities = torch.softmax(
-            calibrated_logits,
-            dim=1,
-        )
-
-        confidence, predicted = torch.max(
-            probabilities,
-            dim=1,
-        )
-
-    predicted_id = int(
-        predicted.item()
-    )
-
-    confidence = float(
-        confidence.item()
-    )
-
-    predicted_class = CLASSES[
-        predicted_id
-    ]
-
-
-    # =========================
-    # FULL PROBABILITY DISTRIBUTION
-    # =========================
-
-    probability_values = (
-        probabilities
-        .detach()
-        .cpu()
-        .numpy()[0]
-    )
-
-    class_probabilities = {
-        CLASSES[i]: round(
-            float(probability_values[i]),
-            6,
-        )
-        for i in range(
-            len(CLASSES)
-        )
-    }
-
-
-    # =========================
-    # MC DROPOUT
-    # =========================
-
-    with torch.no_grad():
-        (
-            mc_probabilities,
-            uncertainty,
-            entropy,
-        ) = mc_dropout_prediction(
-            features,
-            passes=MC_DROPOUT_PASSES,
-        )
-
-    # Keep this available for future
-    # response extensions and validation.
-    del mc_probabilities
-
-
-    # =========================
-    # MAHALANOBIS OOD
-    # =========================
-
-    with torch.no_grad():
-        ood_score = mahalanobis_score(
-            features
-        )
-
-    is_ood = (
-        ood_score > OOD_THRESHOLD
-    )
-
-    ood_status = (
-        "Potential Out-of-Distribution Case"
-        if is_ood
-        else "In-Distribution"
-    )
-
-
-    # =========================
-    # COMPOSITE RISK
-    # =========================
-
-    confidence_risk = (
-        1.0 - confidence
-    )
-
-    uncertainty_risk = min(
-        uncertainty / 0.001,
-        1.0,
-    )
-
-    ood_risk = min(
-        ood_score / OOD_THRESHOLD,
-        1.0,
-    )
-
-    composite_risk = (
-        confidence_risk
-        + uncertainty_risk
-        + ood_risk
-    ) / 3.0
-
-
-    # =========================
-    # DECISION
-    # =========================
-
-    if (
-        composite_risk
-        <= ACCEPT_THRESHOLD
-    ):
-        decision = "ACCEPT"
-
-    elif (
-        composite_risk
-        <= UNCERTAIN_THRESHOLD
-    ):
-        decision = "UNCERTAIN"
-
+    elif model_type == "weights_and_script" and script_file:
+        # Save weights
+        weights_path = os.path.join(WORKSPACE_DIR, "weights.pt")
+        with open(weights_path, "wb") as f:
+            f.write(await model_file.read())
+        # Save user script
+        script_path = os.path.join(WORKSPACE_DIR, "user_model.py")
+        with open(script_path, "wb") as f:
+            f.write(await script_file.read())
+            
+        kwargs_dict = json.loads(kwargs_json) if kwargs_json else {}
+        adapter_code = generate_adapter("weights_and_script", preset, class_name, kwargs_dict, custom_mean, custom_std, custom_size)
     else:
-        decision = "ABSTAIN"
+        # Save full model
+        model_path = os.path.join(WORKSPACE_DIR, "model.pt")
+        with open(model_path, "wb") as f:
+            f.write(await model_file.read())
+            
+        adapter_code = generate_adapter("full_model", preset, None, None, custom_mean, custom_std, custom_size)
+        
+    if class_names_file:
+        cn_path = os.path.join(WORKSPACE_DIR, class_names_file.filename)
+        with open(cn_path, "wb") as f:
+            f.write(await class_names_file.read())
+        
+    adapter_path = os.path.join(WORKSPACE_DIR, "adapter.py")
+    with open(adapter_path, "w") as f:
+        f.write(adapter_code)
+        
+    # Test the generated adapter by running load_model() in a subprocess
+    test_script = """
+import sys
+sys.path.insert(0, '.')
+import adapter
+model = adapter.load_model()
+print('SUCCESS_MARKER')
+"""
+    test_script_path = os.path.join(WORKSPACE_DIR, "test_adapter.py")
+    with open(test_script_path, "w") as f:
+        f.write(test_script)
+        
+    try:
+        result = subprocess.run(
+            [sys.executable, "test_adapter.py"],
+            cwd=WORKSPACE_DIR,
+            capture_output=True,
+            text=True,
+            timeout=30
+        )
+        if "SUCCESS_MARKER" not in result.stdout:
+            return {"status": "error", "message": f"Adapter generation failed to load model. Output: {result.stdout} {result.stderr}"}
+            
+        # Extract the auto-detected layer line
+        detected_line = [line for line in result.stdout.split('\n') if 'Auto-detected FEATURE_LAYER' in line]
+        msg = detected_line[0] if detected_line else "Model loaded, but no FEATURE_LAYER detected."
+        return {"status": "success", "message": msg}
+    except subprocess.TimeoutExpired:
+        return {"status": "error", "message": "Model load timed out."}
+    except Exception as e:
+        return {"status": "error", "message": str(e)}
 
 
-    # =========================
-    # RISK COMPONENTS
-    # =========================
+@app.post("/api/upload/reference")
+async def upload_reference(file: UploadFile = File(...)):
+    zip_path = os.path.join(WORKSPACE_DIR, "reference.zip")
+    with open(zip_path, "wb") as f:
+        f.write(await file.read())
+        
+    ref_dir = os.path.join(WORKSPACE_DIR, "reference_data")
+    if os.path.exists(ref_dir):
+        shutil.rmtree(ref_dir)
+    os.makedirs(ref_dir, exist_ok=True)
+    
+    with zipfile.ZipFile(zip_path, 'r') as zip_ref:
+        zip_ref.extractall(ref_dir)
+        
+    # Optional: flatten if zip contains a single root folder
+    extracted_items = os.listdir(ref_dir)
+    if len(extracted_items) == 1 and os.path.isdir(os.path.join(ref_dir, extracted_items[0])):
+        inner_dir = os.path.join(ref_dir, extracted_items[0])
+        for item in os.listdir(inner_dir):
+            shutil.move(os.path.join(inner_dir, item), ref_dir)
+        os.rmdir(inner_dir)
+        
+    return {"status": "success", "message": "Reference data extracted."}
 
-    risk_components = {
-        "confidence_risk": round(
-            confidence_risk,
-            6,
-        ),
-        "uncertainty_risk": round(
-            uncertainty_risk,
-            6,
-        ),
-        "ood_risk": round(
-            ood_risk,
-            6,
-        ),
+@app.post("/api/fit")
+async def fit():
+    script_path = os.path.join(WORKSPACE_DIR, "adapter.py")
+    ref_dir = os.path.join(WORKSPACE_DIR, "reference_data")
+    config_path = os.path.join(WORKSPACE_DIR, "config.json")
+    
+    payload = {
+        "command": "fit",
+        "script_path": script_path,
+        "reference_dir": ref_dir,
+        "output_config": config_path
     }
+    
+    try:
+        res = run_worker(payload)
+        return {"status": "success", "message": res.get("message")}
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
 
-
-    # =========================
-    # FINAL RESPONSE
-    # =========================
-
-    return {
-        "filename": file.filename,
-
-        # Prediction
-        "prediction": predicted_class,
-        "confidence": round(
-            confidence,
-            4,
-        ),
-
-        # Calibration
-        "temperature": round(
-            TEMPERATURE,
-            6,
-        ),
-        "calibrated": True,
-
-        # All 15 classes
-        "probabilities": class_probabilities,
-
-        # Uncertainty
-        "uncertainty": round(
-            uncertainty,
-            6,
-        ),
-        "entropy": round(
-            entropy,
-            4,
-        ),
-        "mc_dropout_passes": MC_DROPOUT_PASSES,
-
-        # OOD
-        "ood_score": round(
-            ood_score,
-            4,
-        ),
-        "ood_threshold": round(
-            OOD_THRESHOLD,
-            4,
-        ),
-        "ood_threshold_configured": True,
-        "is_ood": bool(
-            is_ood
-        ),
-        "ood_status": ood_status,
-
-        # Risk
-        "risk_components": risk_components,
-        "composite_risk": round(
-            composite_risk,
-            4,
-        ),
-
-        # Decision thresholds
-        "accept_threshold": round(
-            ACCEPT_THRESHOLD,
-            6,
-        ),
-        "uncertain_threshold": round(
-            UNCERTAIN_THRESHOLD,
-            6,
-        ),
-
-        # Decision
-        "decision": decision,
+@app.post("/api/predict")
+async def predict(image: UploadFile = File(...)):
+    script_path = os.path.join(WORKSPACE_DIR, "adapter.py")
+    config_path = os.path.join(WORKSPACE_DIR, "config.json")
+    
+    img_path = os.path.join(WORKSPACE_DIR, "test_input.jpg")
+    with open(img_path, "wb") as f:
+        f.write(await image.read())
+        
+    payload = {
+        "command": "predict",
+        "script_path": script_path,
+        "image_path": img_path,
+        "config_path": config_path
     }
+    
+    try:
+        res = run_worker(payload)
+        return res["result"]
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))

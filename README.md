@@ -1,5 +1,29 @@
-# ClinSure — Towards Safer Clinical Decisions with Uncertainty-Aware AI
+# Abstainity (Built on ClinSure)
+Abstainity is a PyTorch-native reliability layer that gives your image classifiers the ability to say "I don't know" when faced with ambiguous, out-of-distribution, or low-confidence inputs.
 
+## Quickstart
+
+### 1. Run the Backend API
+```bash
+cd backend
+python -m venv venv
+.\venv\Scripts\activate
+pip install -r requirements.txt
+uvicorn api:app --reload --port 8000
+```
+
+### 2. Run the Frontend UI
+In a separate terminal:
+```bash
+npm install
+npm run dev
+```
+
+See `docs/how-it-works.md` for a plain-language explanation of the 3 Abstainity capability tiers (Entropy fallback, MC-Dropout, and Mahalanobis OOD).
+
+---
+
+# Original ClinSure Documentation
 ClinSure is an uncertainty-aware chest X-ray classification and safety triage frontend designed to prevent dangerous overconfident predictions. It combines **temperature calibration**, **MC-Dropout for epistemic uncertainty**, and **Mahalanobis-based Out-of-Distribution (OOD) detection** to classify radiographs into three distinct actionable clinical states:
 
 * **`ACCEPT`**: High calibrated confidence, low epistemic uncertainty, in-distribution. Eligible for automated report draft.
